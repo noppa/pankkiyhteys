@@ -89,6 +89,7 @@ export interface GetFileListOptions {
   EndDate?: string
   Status?: 'NEW' | 'DLD' | 'ALL'
   FileType?: string
+  TargetId?: string
 }
 
 export type ParsePreprocess = (xml: string, document: XMLDocument) => Promise<void> | void
@@ -146,11 +147,13 @@ export class Client extends SoapClient {
     const response = await this.makeRequest('downloadFileListin', {
       '@xmlns': 'http://bxd.fi/xmldata/',
       CustomerId: this.username,
+      Command: 'DownloadFileList',
       Timestamp: this.formatTime(new Date()),
       StartDate: options.StartDate,
       EndDate: options.EndDate,
       Status: options.Status,
       Environment: this.environment,
+      TargetId: options.TargetId,
       SoftwareId: VERSION_STRING,
       FileType: options.FileType
     })
@@ -296,7 +299,7 @@ export function parseResponseHeader(response: XMLElement): ResponseHeader {
 
   if (header) {
     for (const node of header as Array<any>) {
-      data[node.parentNode.nodeName] = node.data
+      data[node.parentNode.localName] = node.data
     }
   }
 
