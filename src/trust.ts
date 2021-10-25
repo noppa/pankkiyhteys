@@ -391,7 +391,7 @@ export default class TrustStore {
   private async loadCachedCertificates() {
     try {
       await file.mkdir(this.tmpDir)
-    } catch (err) {
+    } catch (err: any) {
       // Ignore error if directory exists.
       if (err.code !== 'EEXIST') {
         throw err

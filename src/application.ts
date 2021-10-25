@@ -10,8 +10,9 @@ import { promisify } from 'util'
 import { DOMParser } from 'xmldom'
 import { namespaces, isElementSigned, X509ToCertificate } from './xml'
 import createDebug from 'debug'
-import TrustStore, { Key, sign, verifySignature } from './trust'
+import TrustStore, { generateSigningRequest, Key, sign, verifySignature } from './trust'
 import SoapClient from './soap'
+import { pki } from 'node-forge'
 
 const debug = createDebug('pankkiyhteys')
 const gunzip = promisify(zlib.gunzip)
@@ -20,6 +21,8 @@ export const VERSION_STRING = 'pankkiyhteys v0.10'
 
 type XMLDocument = any
 type XMLElement = Node
+
+export type CompressionMethod = 'RFC1952' | 'GZIP'
 
 export interface ApplicationRequest {
   '@xmlns': 'http://bxd.fi/xmldata/'
@@ -54,7 +57,7 @@ export interface ApplicationRequest {
   /** Compression indicator for the content and compression request for the responses. */
   Compression?: 'true' | 'false'
   /** Name of the compression algorithm. */
-  CompressionMethod?: 'RFC1952'
+  CompressionMethod?: CompressionMethod
   /** Total sum of amounts in the file. */
   AmountTotal?: string
   /** Total sum of transactions in the file. */
@@ -92,9 +95,19 @@ export interface GetFileListOptions {
   TargetId?: string
 }
 
+export interface GetFileOptions {
+  FileType?: string
+  TargetId?: string
+}
+
 export type ParsePreprocess = (xml: string, document: XMLDocument) => Promise<void> | void
 
 export interface CertService {
+  applicationRequestXmlns: string
+  certificateRequestXmlns: string
+
+  getEndpoint(environment: Environment): string
+
   /**
    * Get root CA certificates
    */
@@ -106,6 +119,24 @@ export interface CertService {
   addIntermediaryCertificates(trustStore: TrustStore): Promise<void>
 }
 
+export interface CertApplicationRequest {
+  '@xmlns': string
+  /** Customer id issued by provider. */
+  CustomerId: string
+  /** Request timestamp in ISO 8601. */
+  Timestamp: string
+  /** Application environment string. */
+  Environment: string
+  /** User-agent string. */
+  SoftwareId: string
+  /** Service indentifier */
+  Service: string
+  /** pkcs#10 request */
+  Content?: string
+  /** Shared secret */
+  TransferKey?: string
+}
+
 export class Client extends SoapClient {
   username: string
   key?: Key
@@ -115,6 +146,8 @@ export class Client extends SoapClient {
   endpoint: string
   environment: Environment
   trustStore: TrustStore
+  certService: CertService
+  compressionMethod: CompressionMethod
 
   constructor(
     username: string,
@@ -123,7 +156,8 @@ export class Client extends SoapClient {
     bic: string,
     endpoint: string,
     certService: CertService,
-    environment = Environment.PRODUCTION
+    environment = Environment.PRODUCTION,
+    compressionMethod: CompressionMethod = 'RFC1952'
   ) {
     super()
 
@@ -133,6 +167,8 @@ export class Client extends SoapClient {
     this.bic = bic
     this.endpoint = endpoint
     this.environment = environment
+    this.certService = certService
+    this.compressionMethod = compressionMethod
 
     // Initialize truststore with knowledge of how to fetch intermediary certificates.
     this.trustStore = new TrustStore(certService.getRootCA(), async () => {
@@ -173,23 +209,26 @@ export class Client extends SoapClient {
    *
    * @param fileReference Unique identification of the file.
    */
-  async getFile(fileReference: string): Promise<Buffer> {
+  async getFile(fileReference: string, options: GetFileOptions = {}): Promise<Buffer> {
     const response = await this.makeRequest('downloadFilein', {
       '@xmlns': 'http://bxd.fi/xmldata/',
       CustomerId: this.username,
+      Command: 'DownloadFile',
       Timestamp: this.formatTime(new Date()),
       Environment: this.environment,
       FileReferences: { FileReference: fileReference },
+      TargetId: options.TargetId,
       Compression: 'true',
-      CompressionMethod: 'RFC1952',
-      SoftwareId: VERSION_STRING
+      CompressionMethod: this.compressionMethod,
+      SoftwareId: VERSION_STRING,
+      FileType: options.FileType
     })
 
     const { Compressed, CompressionMethod, Content } = response.ApplicationResponse
 
     // Return decompressed buffer.
     if (Compressed) {
-      if (CompressionMethod !== 'RFC1952') {
+      if (CompressionMethod !== this.compressionMethod) {
         throw new Error(`Unsupported compression method ${CompressionMethod}`)
       }
 
@@ -263,6 +302,135 @@ export class Client extends SoapClient {
         ApplicationResponse: any
       })
     }
+  }
+
+  /**
+   * Get new certificate from cert service.
+   *
+   * Private must have following conditions:
+   *   * Modulus lenth = 2048
+   *   * If key already has signed certificate the current certificate will be returned instead.
+   *
+   * Client must save the private key to persistent storage before calling this method.
+   *
+   * @param privateKey RSA private key (pem)
+   */
+  async getCertificate(privateKey: string) {
+    debug('renewCertificate')
+
+    const csr = generateSigningRequest(privateKey, this.username, 'FI')
+
+    const request: CertApplicationRequest = {
+      '@xmlns': this.certService.applicationRequestXmlns,
+      CustomerId: this.username,
+      Timestamp: this.formatTime(new Date()),
+      Environment: this.environment,
+      SoftwareId: VERSION_STRING,
+      Service: 'MATU',
+      Content: csr
+    }
+
+    // Convert application request xml.
+    const requestXml = this.signApplicationRequest(
+      builder
+        .create({ CertApplicationRequest: request }, { version: '1.0', encoding: 'UTF-8' })
+        .end()
+    )
+
+    // Cert service envelopes are not signed.
+    const response = await this.makeSoapRequest(this.certService.getEndpoint(this.environment), {
+      getCertificatein: {
+        '@xmlns': this.certService.certificateRequestXmlns,
+        RequestHeader: {
+          SenderId: this.username,
+          RequestId: this.requestId(),
+          Timestamp: this.formatTime(new Date())
+        },
+        ApplicationRequest: Buffer.from(requestXml).toString('base64')
+      }
+    })
+
+    const applicationResponse = await parseApplicationResponse(response, this.verifyRequestCallback)
+
+    const {
+      CertApplicationResponse: {
+        Certificates: {
+          Certificate: { Name, Certificate, CertificateFormat }
+        }
+      }
+    } = applicationResponse
+
+    const newCert = pki.certificateToPem(X509ToCertificate(Certificate))
+
+    // Start using the new key
+    this.key = new Key(privateKey, newCert)
+
+    return newCert
+  }
+
+  /**
+   * Get initial certificate from cert service using transfer key.
+   *
+   * Private must have following conditions:
+   *   * Modulus lenth = 2048
+   *   * If key already has signed certificate the current certificate will be returned instead.
+   *
+   * Client must save the private key to persistent storage before calling this method.
+   *
+   * @param privateKey RSA private key (pem)
+   * @param transferKey Bank issued transfer key
+   */
+  async getInitialCertificate(privateKey: string, transferKey: string) {
+    debug('getInitialCertificate')
+
+    const csr = generateSigningRequest(privateKey, this.username, 'FI')
+
+    const request: CertApplicationRequest = {
+      '@xmlns': 'http://op.fi/mlp/xmldata/',
+      CustomerId: this.username,
+      Timestamp: this.formatTime(new Date()),
+      Environment: this.environment,
+      SoftwareId: VERSION_STRING,
+      Service: 'MATU',
+      Content: csr,
+      TransferKey: transferKey
+    }
+
+    // Convert application request xml.
+    // Application request is not signed when using transfer key.
+    const requestXml = builder
+      .create({ CertApplicationRequest: request }, { version: '1.0', encoding: 'UTF-8' })
+      .end()
+
+    // Cert service envelopes are not signed.
+    const response = await this.makeSoapRequest(this.certService.getEndpoint(this.environment), {
+      getCertificatein: {
+        '@xmlns': 'http://mlp.op.fi/OPCertificateService',
+        RequestHeader: {
+          SenderId: this.username,
+          RequestId: this.requestId(),
+          Timestamp: this.formatTime(new Date())
+        },
+        ApplicationRequest: Buffer.from(requestXml).toString('base64')
+      }
+    })
+
+    const applicationResponse = await parseApplicationResponse(response, this.verifyRequestCallback)
+
+    const {
+      CertApplicationResponse: {
+        Certificates: {
+          Certificate: { Name, Certificate, CertificateFormat }
+        }
+      }
+    } = applicationResponse
+
+    const newCert = pki.certificateToPem(X509ToCertificate(Certificate))
+
+    // Start using the new key
+    this.key = new Key(privateKey, newCert)
+
+    return newCert
   }
 
   /**
